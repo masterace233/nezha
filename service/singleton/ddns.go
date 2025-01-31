@@ -1,37 +1,64 @@
 package singleton
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/libdns/cloudflare"
-	"github.com/libdns/tencentcloud"
+	tencentcloud "github.com/nezhahq/libdns-tencentcloud"
 
-	"github.com/naiba/nezha/model"
-	ddns2 "github.com/naiba/nezha/pkg/ddns"
-	"github.com/naiba/nezha/pkg/ddns/dummy"
-	"github.com/naiba/nezha/pkg/ddns/webhook"
+	"github.com/nezhahq/nezha/model"
+	ddns2 "github.com/nezhahq/nezha/pkg/ddns"
+	"github.com/nezhahq/nezha/pkg/ddns/dummy"
+	"github.com/nezhahq/nezha/pkg/ddns/webhook"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 var (
-	ddnsCache     map[uint64]*model.DDNSProfile
-	ddnsCacheLock sync.RWMutex
+	DDNSCache     map[uint64]*model.DDNSProfile
+	DDNSCacheLock sync.RWMutex
+	DDNSList      []*model.DDNSProfile
+	DDNSListLock  sync.RWMutex
 )
 
 func initDDNS() {
-	OnDDNSUpdate()
+	DB.Find(&DDNSList)
+	DDNSCache = make(map[uint64]*model.DDNSProfile)
+	for i := 0; i < len(DDNSList); i++ {
+		DDNSCache[DDNSList[i].ID] = DDNSList[i]
+	}
+
 	OnNameserverUpdate()
 }
 
-func OnDDNSUpdate() {
-	var ddns []*model.DDNSProfile
-	DB.Find(&ddns)
-	ddnsCacheLock.Lock()
-	defer ddnsCacheLock.Unlock()
-	ddnsCache = make(map[uint64]*model.DDNSProfile)
-	for i := 0; i < len(ddns); i++ {
-		ddnsCache[ddns[i].ID] = ddns[i]
+func OnDDNSUpdate(p *model.DDNSProfile) {
+	DDNSCacheLock.Lock()
+	defer DDNSCacheLock.Unlock()
+	DDNSCache[p.ID] = p
+}
+
+func OnDDNSDelete(id []uint64) {
+	DDNSCacheLock.Lock()
+	defer DDNSCacheLock.Unlock()
+
+	for _, i := range id {
+		delete(DDNSCache, i)
 	}
+}
+
+func UpdateDDNSList() {
+	DDNSCacheLock.RLock()
+	defer DDNSCacheLock.RUnlock()
+
+	DDNSListLock.Lock()
+	defer DDNSListLock.Unlock()
+
+	DDNSList = utils.MapValuesToSlice(DDNSCache)
+	slices.SortFunc(DDNSList, func(a, b *model.DDNSProfile) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 }
 
 func OnNameserverUpdate() {
@@ -40,15 +67,16 @@ func OnNameserverUpdate() {
 
 func GetDDNSProvidersFromProfiles(profileId []uint64, ip *ddns2.IP) ([]*ddns2.Provider, error) {
 	profiles := make([]*model.DDNSProfile, 0, len(profileId))
-	ddnsCacheLock.RLock()
+	DDNSCacheLock.RLock()
 	for _, id := range profileId {
-		if profile, ok := ddnsCache[id]; ok {
+		if profile, ok := DDNSCache[id]; ok {
 			profiles = append(profiles, profile)
 		} else {
+			DDNSCacheLock.RUnlock()
 			return nil, fmt.Errorf("无法找到DDNS配置 ID %d", id)
 		}
 	}
-	ddnsCacheLock.RUnlock()
+	DDNSCacheLock.RUnlock()
 
 	providers := make([]*ddns2.Provider, 0, len(profiles))
 	for _, profile := range profiles {
@@ -67,7 +95,7 @@ func GetDDNSProvidersFromProfiles(profileId []uint64, ip *ddns2.IP) ([]*ddns2.Pr
 			provider.Setter = &tencentcloud.Provider{SecretId: profile.AccessID, SecretKey: profile.AccessSecret}
 			providers = append(providers, provider)
 		default:
-			return nil, fmt.Errorf("无法找到配置的DDNS提供者ID %d", profile.Provider)
+			return nil, fmt.Errorf("无法找到配置的DDNS提供者 %s", profile.Provider)
 		}
 	}
 	return providers, nil

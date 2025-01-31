@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/libdns/libdns"
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/pkg/utils"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 const (
@@ -77,7 +77,7 @@ func (provider *Provider) prepareRequest(ctx context.Context) (*http.Request, er
 		return nil, err
 	}
 
-	headers, err := utils.GjsonParseStringMap(
+	headers, err := utils.GjsonIter(
 		provider.formatWebhookString(provider.DDNSProfile.WebhookHeaders))
 	if err != nil {
 		return nil, err
@@ -139,7 +139,7 @@ func (provider *Provider) reqBody() (string, error) {
 	case requestTypeJSON:
 		return provider.formatWebhookString(provider.DDNSProfile.WebhookRequestBody), nil
 	case requestTypeForm:
-		data, err := utils.GjsonParseStringMap(provider.DDNSProfile.WebhookRequestBody)
+		data, err := utils.GjsonIter(provider.DDNSProfile.WebhookRequestBody)
 		if err != nil {
 			return "", err
 		}
