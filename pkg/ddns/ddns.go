@@ -10,8 +10,8 @@ import (
 	"github.com/libdns/libdns"
 	"github.com/miekg/dns"
 
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/pkg/utils"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 var (
@@ -28,7 +28,6 @@ type Provider struct {
 	ctx        context.Context
 	ipAddr     string
 	recordType string
-	domain     string
 	prefix     string
 	zone       string
 
@@ -43,25 +42,28 @@ func InitDNSServers(s string) {
 	}
 }
 
-func (provider *Provider) UpdateDomain(ctx context.Context) {
+func (provider *Provider) GetProfileID() uint64 {
+	return provider.DDNSProfile.ID
+}
+
+func (provider *Provider) UpdateDomain(ctx context.Context, overrideDomains ...string) {
 	provider.ctx = ctx
-	for _, domain := range provider.DDNSProfile.Domains {
+	for _, domain := range utils.IfOr(len(overrideDomains) > 0, overrideDomains, provider.DDNSProfile.Domains) {
 		for retries := 0; retries < int(provider.DDNSProfile.MaxRetries); retries++ {
-			provider.domain = domain
-			log.Printf("NEZHA>> 正在尝试更新域名(%s)DDNS(%d/%d)", provider.domain, retries+1, provider.DDNSProfile.MaxRetries)
-			if err := provider.updateDomain(); err != nil {
-				log.Printf("NEZHA>> 尝试更新域名(%s)DDNS失败: %v", provider.domain, err)
+			log.Printf("NEZHA>> Updating DNS Record of domain %s: %d/%d", domain, retries+1, provider.DDNSProfile.MaxRetries)
+			if err := provider.updateDomain(domain); err != nil {
+				log.Printf("NEZHA>> Failed to update DNS record of domain %s: %v", domain, err)
 			} else {
-				log.Printf("NEZHA>> 尝试更新域名(%s)DDNS成功", provider.domain)
+				log.Printf("NEZHA>> Update DNS record of domain %s succeeded", domain)
 				break
 			}
 		}
 	}
 }
 
-func (provider *Provider) updateDomain() error {
+func (provider *Provider) updateDomain(domain string) error {
 	var err error
-	provider.prefix, provider.zone, err = splitDomainSOA(provider.domain)
+	provider.prefix, provider.zone, err = splitDomainSOA(domain)
 	if err != nil {
 		return err
 	}
