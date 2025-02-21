@@ -1,54 +1,75 @@
 package singleton
 
 import (
+	"cmp"
 	"fmt"
-	"sync"
+	"slices"
 
 	"github.com/libdns/cloudflare"
-	"github.com/libdns/tencentcloud"
+	tencentcloud "github.com/nezhahq/libdns-tencentcloud"
 
-	"github.com/naiba/nezha/model"
-	ddns2 "github.com/naiba/nezha/pkg/ddns"
-	"github.com/naiba/nezha/pkg/ddns/dummy"
-	"github.com/naiba/nezha/pkg/ddns/webhook"
+	"github.com/nezhahq/nezha/model"
+	ddns2 "github.com/nezhahq/nezha/pkg/ddns"
+	"github.com/nezhahq/nezha/pkg/ddns/dummy"
+	"github.com/nezhahq/nezha/pkg/ddns/webhook"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
-var (
-	ddnsCache     map[uint64]*model.DDNSProfile
-	ddnsCacheLock sync.RWMutex
-)
-
-func initDDNS() {
-	OnDDNSUpdate()
-	OnNameserverUpdate()
+type DDNSClass struct {
+	class[uint64, *model.DDNSProfile]
 }
 
-func OnDDNSUpdate() {
-	var ddns []*model.DDNSProfile
-	DB.Find(&ddns)
-	ddnsCacheLock.Lock()
-	defer ddnsCacheLock.Unlock()
-	ddnsCache = make(map[uint64]*model.DDNSProfile)
-	for i := 0; i < len(ddns); i++ {
-		ddnsCache[ddns[i].ID] = ddns[i]
+func NewDDNSClass() *DDNSClass {
+	var sortedList []*model.DDNSProfile
+
+	DB.Find(&sortedList)
+	list := make(map[uint64]*model.DDNSProfile, len(sortedList))
+	for _, profile := range sortedList {
+		list[profile.ID] = profile
 	}
+
+	dc := &DDNSClass{
+		class: class[uint64, *model.DDNSProfile]{
+			list:       list,
+			sortedList: sortedList,
+		},
+	}
+
+	OnNameserverUpdate()
+	return dc
 }
 
-func OnNameserverUpdate() {
-	ddns2.InitDNSServers(Conf.DNSServers)
+func (c *DDNSClass) Update(p *model.DDNSProfile) {
+	c.listMu.Lock()
+	c.list[p.ID] = p
+	c.listMu.Unlock()
+
+	c.sortList()
 }
 
-func GetDDNSProvidersFromProfiles(profileId []uint64, ip *ddns2.IP) ([]*ddns2.Provider, error) {
+func (c *DDNSClass) Delete(idList []uint64) {
+	c.listMu.Lock()
+	for _, id := range idList {
+		delete(c.list, id)
+	}
+	c.listMu.Unlock()
+
+	c.sortList()
+}
+
+func (c *DDNSClass) GetDDNSProvidersFromProfiles(profileId []uint64, ip *model.IP) ([]*ddns2.Provider, error) {
 	profiles := make([]*model.DDNSProfile, 0, len(profileId))
-	ddnsCacheLock.RLock()
+
+	c.listMu.RLock()
 	for _, id := range profileId {
-		if profile, ok := ddnsCache[id]; ok {
+		if profile, ok := c.list[id]; ok {
 			profiles = append(profiles, profile)
 		} else {
+			c.listMu.RUnlock()
 			return nil, fmt.Errorf("无法找到DDNS配置 ID %d", id)
 		}
 	}
-	ddnsCacheLock.RUnlock()
+	c.listMu.RUnlock()
 
 	providers := make([]*ddns2.Provider, 0, len(profiles))
 	for _, profile := range profiles {
@@ -67,8 +88,26 @@ func GetDDNSProvidersFromProfiles(profileId []uint64, ip *ddns2.IP) ([]*ddns2.Pr
 			provider.Setter = &tencentcloud.Provider{SecretId: profile.AccessID, SecretKey: profile.AccessSecret}
 			providers = append(providers, provider)
 		default:
-			return nil, fmt.Errorf("无法找到配置的DDNS提供者ID %d", profile.Provider)
+			return nil, fmt.Errorf("无法找到配置的DDNS提供者 %s", profile.Provider)
 		}
 	}
 	return providers, nil
+}
+
+func (c *DDNSClass) sortList() {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+
+	sortedList := utils.MapValuesToSlice(c.list)
+	slices.SortFunc(sortedList, func(a, b *model.DDNSProfile) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+
+	c.sortedListMu.Lock()
+	defer c.sortedListMu.Unlock()
+	c.sortedList = sortedList
+}
+
+func OnNameserverUpdate() {
+	ddns2.InitDNSServers(Conf.DNSServers)
 }

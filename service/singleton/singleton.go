@@ -1,25 +1,44 @@
 package singleton
 
 import (
+	_ "embed"
+	"iter"
 	"log"
+	"maps"
+	"slices"
+	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
+	"gopkg.in/yaml.v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/pkg/utils"
+	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 var Version = "debug"
 
 var (
-	Conf  *model.Config
-	Cache *cache.Cache
-	DB    *gorm.DB
-	Loc   *time.Location
+	Conf              *model.Config
+	Cache             *cache.Cache
+	DB                *gorm.DB
+	Loc               *time.Location
+	FrontendTemplates []model.FrontendTemplate
+	DashboardBootTime = uint64(time.Now().Unix())
+
+	ServerShared          *ServerClass
+	ServiceSentinelShared *ServiceSentinel
+	DDNSShared            *DDNSClass
+	NotificationShared    *NotificationClass
+	NATShared             *NATClass
+	CronShared            *CronClass
 )
+
+//go:embed frontend-templates.yaml
+var frontendTemplatesYAML []byte
 
 func InitTimezoneAndCache() {
 	var err error
@@ -33,18 +52,27 @@ func InitTimezoneAndCache() {
 
 // LoadSingleton 加载子服务并执行
 func LoadSingleton() {
-	loadNotifications() // 加载通知服务
-	loadServers()       // 加载服务器列表
-	loadCronTasks()     // 加载定时任务
-	loadAPI()
-	initNAT()
-	initDDNS()
+	initUser()                                  // 加载用户ID绑定表
+	initI18n()                                  // 加载本地化服务
+	NotificationShared = NewNotificationClass() // 加载通知服务
+	ServerShared = NewServerClass()             // 加载服务器列表
+	CronShared = NewCronClass()                 // 加载定时任务
+	NATShared = NewNATClass()
+	DDNSShared = NewDDNSClass()
+}
+
+// InitFrontendTemplates 从内置文件中加载FrontendTemplates
+func InitFrontendTemplates() {
+	err := yaml.Unmarshal(frontendTemplatesYAML, &FrontendTemplates)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // InitConfigFromPath 从给出的文件路径中加载配置
 func InitConfigFromPath(path string) {
 	Conf = &model.Config{}
-	err := Conf.Read(path)
+	err := Conf.Read(path, FrontendTemplates)
 	if err != nil {
 		panic(err)
 	}
@@ -62,10 +90,11 @@ func InitDBFromPath(path string) {
 	if Conf.Debug {
 		DB = DB.Debug()
 	}
-	err = DB.AutoMigrate(model.Server{}, model.User{},
-		model.Notification{}, model.AlertRule{}, model.Monitor{},
-		model.MonitorHistory{}, model.Cron{}, model.Transfer{},
-		model.ApiToken{}, model.NAT{}, model.DDNSProfile{})
+	err = DB.AutoMigrate(model.Server{}, model.User{}, model.ServerGroup{}, model.NotificationGroup{},
+		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
+		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
+		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
+		model.WAF{}, model.Oauth2Bind{})
 	if err != nil {
 		panic(err)
 	}
@@ -73,12 +102,13 @@ func InitDBFromPath(path string) {
 
 // RecordTransferHourlyUsage 对流量记录进行打点
 func RecordTransferHourlyUsage() {
-	ServerLock.Lock()
-	defer ServerLock.Unlock()
+	ServerShared.listMu.RLock()
+	defer ServerShared.listMu.RUnlock()
+
 	now := time.Now()
 	nowTrimSeconds := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 	var txs []model.Transfer
-	for id, server := range ServerList {
+	for id, server := range ServerShared.list {
 		tx := model.Transfer{
 			ServerID: id,
 			In:       utils.Uint64SubInt64(server.State.NetInTransfer, server.PrevTransferInSnapshot),
@@ -95,17 +125,17 @@ func RecordTransferHourlyUsage() {
 	if len(txs) == 0 {
 		return
 	}
-	log.Println("NEZHA>> Cron 流量统计入库", len(txs), DB.Create(txs).Error)
+	log.Printf("NEZHA>> Saved traffic metrics to database. Affected %d row(s), Error: %v", len(txs), DB.Create(txs).Error)
 }
 
-// CleanMonitorHistory 清理无效或过时的 监控记录 和 流量记录
-func CleanMonitorHistory() {
+// CleanServiceHistory 清理无效或过时的 监控记录 和 流量记录
+func CleanServiceHistory() {
 	// 清理已被删除的服务器的监控记录与流量记录
-	DB.Unscoped().Delete(&model.MonitorHistory{}, "created_at < ? OR monitor_id NOT IN (SELECT `id` FROM monitors)", time.Now().AddDate(0, 0, -30))
+	DB.Unscoped().Delete(&model.ServiceHistory{}, "created_at < ? OR service_id NOT IN (SELECT `id` FROM services)", time.Now().AddDate(0, 0, -30))
 	// 由于网络监控记录的数据较多，并且前端仅使用了 1 天的数据
 	// 考虑到 sqlite 数据量问题，仅保留一天数据，
 	// server_id = 0 的数据会用于/service页面的可用性展示
-	DB.Unscoped().Delete(&model.MonitorHistory{}, "(created_at < ? AND server_id != 0) OR monitor_id NOT IN (SELECT `id` FROM monitors)", time.Now().AddDate(0, 0, -1))
+	DB.Unscoped().Delete(&model.ServiceHistory{}, "(created_at < ? AND server_id != 0) OR service_id NOT IN (SELECT `id` FROM services)", time.Now().AddDate(0, 0, -1))
 	DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT `id` FROM servers)")
 	// 计算可清理流量记录的时长
 	var allServerKeep time.Time
@@ -153,4 +183,59 @@ func IPDesensitize(ip string) string {
 		return ip
 	}
 	return utils.IPDesensitize(ip)
+}
+
+type class[K comparable, V model.CommonInterface] struct {
+	list   map[K]V
+	listMu sync.RWMutex
+
+	sortedList   []V
+	sortedListMu sync.RWMutex
+}
+
+func (c *class[K, V]) Get(id K) (s V, ok bool) {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+
+	s, ok = c.list[id]
+	return
+}
+
+func (c *class[K, V]) GetList() map[K]V {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+
+	return maps.Clone(c.list)
+}
+
+func (c *class[K, V]) GetSortedList() []V {
+	c.sortedListMu.RLock()
+	defer c.sortedListMu.RUnlock()
+
+	return slices.Clone(c.sortedList)
+}
+
+func (c *class[K, V]) Range(fn func(k K, v V) bool) {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+
+	for k, v := range c.list {
+		if !fn(k, v) {
+			break
+		}
+	}
+}
+
+func (c *class[K, V]) CheckPermission(ctx *gin.Context, idList iter.Seq[K]) bool {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+
+	for id := range idList {
+		if s, ok := c.list[id]; ok {
+			if !s.HasPermission(ctx) {
+				return false
+			}
+		}
+	}
+	return true
 }
